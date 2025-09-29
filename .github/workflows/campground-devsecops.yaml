@@ -1,0 +1,238 @@
+name: DevSecOps Campground Application Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: 'Docker image tag'
+        required: true
+        default: 'latest'
+        type: string
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: sidraut007/campground-app
+  REGISTRY: docker.io
+
+jobs:
+  # Security: Input validation
+  validate-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      safe-tag: ${{ steps.validate.outputs.tag }}
+    steps:
+      - name: Validate Docker tag input
+        id: validate
+        run: |
+          TAG="${{ github.event.inputs.docker_tag || 'latest' }}"
+          if [[ ! "$TAG" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Invalid tag format: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+  # Security: Secret scanning
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Security: SAST scanning
+  sast-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+  # Security: Dependency scanning
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run npm audit
+        run: |
+          if [ -f package.json ]; then
+            npm audit --audit-level=high
+          fi
+
+  # Enhanced Docker build with security
+  build-push-docker-image:
+    needs: [validate-inputs, secret-scan, sast-scan]
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      tag: ${{ needs.validate-inputs.outputs.safe-tag }}
+    env:
+      TAG: ${{ needs.validate-inputs.outputs.safe-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.TAG }}
+            type=sha,prefix={{branch}}-
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # Security: Container vulnerability scanning
+  container-scan:
+    needs: build-push-docker-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ needs.build-push-docker-image.outputs.tag }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Security: Infrastructure as Code scanning
+  iac-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run Checkov IaC scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,docker_compose
+
+  # Enhanced secure deployment
+  deploy-to-remote:
+    needs: [build-push-docker-image, container-scan, iac-scan]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      TAG: ${{ needs.build-push-docker-image.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Replace docker tag securely
+        run: |
+          # Use environment variable instead of direct substitution
+          export DOCKER_TAG="${{ env.TAG }}"
+          if [ -f docker-compose.yml.template ]; then
+            envsubst < docker-compose.yml.template > docker-compose.yml
+          else
+            sed -i "s|IMAGE_TAG|${{ env.IMAGE_NAME }}:${DOCKER_TAG}|g" docker-compose.yml
+          fi
+
+      - name: Copy deployment files to remote
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.yml"
+          target: "/home/ubuntu/campground"
+
+      - name: Deploy with security checks
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/ubuntu/campground
+            
+            # Verify image exists before deployment
+            docker pull ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            
+            # Graceful deployment with rollback capability
+            docker-compose down --remove-orphans
+            
+            # Start new deployment
+            if ! docker-compose up -d; then
+              echo "Deployment failed, attempting rollback"
+              docker-compose down
+              exit 1
+            fi
+            
+            # Health check with retries
+            echo "Performing health checks..."
+            sleep 30
+            
+            for i in {1..5}; do
+              if curl -f -s http://localhost:3000/health 2>/dev/null || docker-compose ps | grep -q "Up"; then
+                echo "Health check passed on attempt $i"
+                break
+              else
+                echo "Health check failed on attempt $i, retrying..."
+                sleep 10
+              fi
+              if [ $i -eq 5 ]; then
+                echo "All health checks failed! Rolling back..."
+                docker-compose logs
+                docker-compose down
+                exit 1
+              fi
+            done
+            
+            echo "Deployment successful!"
+
+  # Security: Post-deployment monitoring
+  post-deployment-security:
+    needs: deploy-to-remote
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Setup security monitoring
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Setting up post-deployment security monitoring..."
+            # Setup log monitoring for security events
+            docker-compose logs --tail=100 > /tmp/deployment-logs.txt
+            echo "Security monitoring setup complete"

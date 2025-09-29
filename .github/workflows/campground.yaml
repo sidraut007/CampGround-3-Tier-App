@@ -1,0 +1,68 @@
+name: Camp-app Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: 'Docker image tag'
+        required: true
+        default: 'latest'
+
+jobs:
+  Build-push-Docker-image:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: sidraut007/campground-app
+      tag: ${{ inputs.docker_tag }}
+
+    steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v2
+        - name: Login to Docker Hub
+          uses: docker/login-action@v2
+          with:
+            username: ${{ secrets.DOCKER_USERNAME }}
+            password: ${{ secrets.DOCKER_PASSWORD }}
+        - name: Build and push
+          uses: docker/build-push-action@v4
+          with:
+            context: .
+            push: true
+            tags: ${{ env.tag }}
+            file: ./Dockerfile
+  deploy-to-remote:
+    runs-on: ubuntu-latest
+    needs: Build-push-Docker-image
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Replace docker tag
+        run: |
+          sed -i "s|IMAGE_TAG|${{ needs.Build-push-Docker-image.outputs.tag }}|g" docker-compose.yml
+
+      - name: Copy docker-compose.yml to remote
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: ./docker-compose.yml
+          destination: /home/ubuntu/campground
+      
+
+      - name: Deploy to Remote
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/ubuntu/campground
+            docker-compose down
+            docker-compose up -d
+  
+
+  
