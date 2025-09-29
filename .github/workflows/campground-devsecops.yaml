@@ -8,10 +8,10 @@ on:
         required: true
         default: 'latest'
         type: string
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
+  # push:
+  #   branches: [ main, develop ]
+  # pull_request:
+  #   branches: [ main ]
 
 env:
   IMAGE_NAME: sidraut007/campground-app
