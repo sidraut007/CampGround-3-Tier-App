@@ -10,6 +10,12 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
+      - MAPBOX_TOKEN=${MAPBOX_TOKEN}
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+      - CLOUDINARY_KEY=${CLOUDINARY_KEY}
+      - CLOUDINARY_SECRET=${CLOUDINARY_SECRET}
+      - DB_URL=${DB_URL}
+      - SECRET=${SECRET}
     networks:
       - campground-network
     security_opt:
